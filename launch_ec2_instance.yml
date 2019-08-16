@@ -1,0 +1,182 @@
+---
+ - name: Provision an EC2 instance
+   hosts: localhost
+   connection: local
+   gather_facts: False
+
+   vars:
+    instance_type: t2.micro
+    security_groups: ['USE1-PROD-Base', 'USE1-OPS-AdminAccess', 'USE1-PROD-JOBSUB']
+    image: ami-12345fgf
+    region: us-east-1
+    iam_role: my-role-name
+    keypair: my-key
+    SubnetId: subnet-39384fsdvs
+    count: 1
+
+   tasks:
+
+    - name: Launch the new EC2 instance
+      ec2:
+        count_tag: 
+          Name: "{{ name }}"
+        exact_count: 1
+        group: "{{ security_groups }}"
+        image: "{{ image }}"
+        key_name: "{{ keypair }}"
+        instance_type: "{{ instance_type }}"
+        instance_profile_name: "{{ iam_role }}"
+        region: "{{ region }}"
+        termination_protection: yes
+        vpc_subnet_id: "{{ SubnetId }}"
+        instance_tags:
+           Env: prod
+           Location: use1
+           Name: "{{ name }}"
+           Profile: jobsub
+           approval: planned
+           department: mpe
+           environment: prod
+           note: prod instances
+           project: prod Project
+        wait: yes
+      register: ec2_out
+      
+    - name: Retrieve all volumes for a queried instance
+      ec2_vol:
+        instance: "{{ ec2_out.tagged_instances[0].id }}"
+        region: "{{ region }}"
+        state: list
+      register: ec2_vol_out
+
+    - name: Ensure all volumes are tagged
+      ec2_tag:
+        region: "{{ region }}"
+        resource: "{{ item.id }}"
+        state: present
+        tags:
+          Env: prod
+          Location: use1
+          Name: "{{ name }}"
+          Profile: jobsub
+          approval: planned
+          department: mpe
+          environment: prod
+          note: my instances
+          project: my Project
+      with_items: "{{ ec2_vol_out.volumes | default([]) }}"
+      
+
+    - name: wait for the instance to respond    
+      wait_for:
+        port: 22
+        delay: 10
+        host: "{{ item.private_ip }}"
+        state: started
+      with_items: "{{ ec2_out.tagged_instances }}"
+
+    - name: add the instance to dns
+      route53:
+        command: create
+        zone: cointreau.local
+        private_zone: yes
+        record: "{{ name }}"
+        type: A
+        ttl: 180
+        value: "{{ item.private_ip }}"
+        overwrite: yes
+      with_items: "{{ ec2_out.tagged_instances }}"
+
+
+    - name: add the instance to reverse dns
+      route53:
+        command: create
+        zone: 0.10.in-addr.arpa
+        private_zone: yes
+        record: "{{ item.private_ip.split('.')[3] }}.{{ item.private_ip.split('.')[2] }}.{{ item.private_ip.split('.')[1] }}.{{ item.private_ip.split('.')[0] }}.in-addr.arpa"
+        type: PTR
+        ttl: 180
+        value: "{{ name }}." # the dot at the end is importante.
+        overwrite: yes
+      with_items: "{{ ec2_out.tagged_instances }}"
+    
+    - name: add the host to a launched group
+      add_host:
+        hostname: "{{ ec2_out.tagged_instances[0].private_ip }}"
+        groupname: launched
+
+ - hosts: launched
+   remote_user: centos
+   vars:
+     ansible_ssh_private_key_file: "/path/of/pem/keys/my-key.pem"
+   become: true
+   tasks:
+   - name: copy cointreau prod key
+     copy:
+      src: /path/of/pem/keys/my-key.pem
+      dest: /home/centos/my-key.pem
+      owner: root
+      group: root
+      mode: '0400'
+
+   - name: replace Hostname from /etc/sysconfig/network
+     replace:
+      path: /etc/sysconfig/network
+      regexp: '^(.*)HOSTNAME=(.*)$'
+      replace: '{{ name }}'
+      backup: no
+
+   - name: replace ServerAlias from /etc/httpd/conf.d/conduit-jobsub.conf
+     replace:
+      path: /etc/httpd/conf.d/conduit-jobsub.conf
+      regexp: '^(.*)ServerAlias(.*)$'
+      replace: 'ServerAlias {{ name }}'
+      backup: no
+
+   - name: replace ServerName from /etc/httpd/conf.d/conduit-jobsub.conf
+     replace:
+      path: /etc/httpd/conf.d/conduit-jobsub.conf
+      regexp: '^(.*)ServerName(.*)$'
+      replace: 'ServerName {{ name }}'
+      backup: no
+
+   - name: replace hostname from /etc/luigi/client.cfg
+     replace:
+      path: /etc/luigi/client.cfg
+      regexp: '^(.*)jobsub_api_server_url=(.*)$'
+      replace: 'jobsub_api_server_url=http://{{ name }}'
+      backup: no
+
+   - name: replace hostname from /etc/conduit/core.cfg
+     replace:
+      path: /etc/conduit/core.cfg
+      regexp: '^(.*)jobsub_api_server_url=(.*)$'
+      replace: 'jobsub_api_server_url=http://{{ name }}'
+      backup: no
+
+ - hosts: torque
+   remote_user: centos
+   become: yes
+   become_user: cointreau
+   tasks:
+   - name: pub key entry in torque nodes
+     shell: ssh-keyscan -H {{ name }} >> /home/user1/.ssh/known_hosts
+
+ - hosts: master
+   remote_user: centos
+   become: true
+   tasks:
+#  - name: check entry in /etc/hosts.equiv
+#    shell: cat /etc/hosts.equiv | grep {{ name }}
+#    register: test_grep
+   - name: delete jobsub host entry if present in /etc/hosts.equiv file
+     lineinfile:
+      dest: /etc/hosts.equiv
+      regexp: >
+        ^{{ name }}$
+      state: absent
+   - name: enter new jobsub detail in /etc/hosts.equiv
+     lineinfile:
+      dest: /etc/hosts.equiv
+      line: '{{ name }}'
+      state: present
